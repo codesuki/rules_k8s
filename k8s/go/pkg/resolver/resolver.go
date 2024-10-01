@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"os"
 	"path"
 	"strings"
 
@@ -28,6 +29,7 @@ type Flags struct {
 	NoPush            bool
 	StampInfoFile     utils.ArrayStringFlags
 	ImgSpecs          utils.ArrayStringFlags
+	OCIImages         utils.ArrayStringFlags
 }
 
 // Commandline flags
@@ -39,6 +41,7 @@ const (
 	FlagNoPush            = "no_push"
 	FlagImgSpecs          = "image_spec"
 	FlagStampInfoFile     = "stamp-info-file"
+	FlagOCIImages         = "oci_image"
 )
 
 // RegisterFlags will register the resolvers flags with the provided FlagSet.
@@ -52,9 +55,9 @@ func RegisterFlags(flagset *flag.FlagSet) *Flags {
 	flagset.StringVar(&flags.SubstitutionsFile, FlagSubstitutionsFile, "", "A file with a list of substitutions that were made in the YAML template. Any stamp values that appear are stamped by the resolver.")
 	flagset.BoolVar(&flags.AllowUnusedImages, FlagAllowUnusedImages, false, "Allow images that don't appear in the JSON. This is useful when generating multiple SKUs of a k8s_object, only some of which use a particular image.")
 	flagset.BoolVar(&flags.NoPush, FlagNoPush, false, "Don't push images after resolving digests.")
-	flagset.Var(&flags.ImgSpecs, FlagImgSpecs, "Associative lists of the constitutent elements of a docker image.")
+	flagset.Var(&flags.ImgSpecs, FlagImgSpecs, "Associative lists of the constituent elements of a docker image.")
 	flagset.Var(&flags.StampInfoFile, FlagStampInfoFile, "One or more Bazel stamp info files.")
-
+	flagset.Var(&flags.OCIImages, FlagOCIImages, "Associative lists of constituent elements of an OCI image.")
 	return &flags
 }
 
@@ -102,13 +105,8 @@ func (r *Resolver) Resolve() (resolvedTemplate string, err error) {
 		return "", fmt.Errorf("Failed to initialize the stamper: %w", err)
 	}
 
-	specs := []imageSpec{}
-	for _, s := range r.flags.ImgSpecs {
-		spec, err := parseImageSpec(s)
-		if err != nil {
-			return "", fmt.Errorf("Unable to parse image spec %q: %s", s, err)
-		}
-		specs = append(specs, spec)
+	if len(r.flags.ImgSpecs) != 0 && len(r.flags.OCIImages) != 0 {
+		return "", fmt.Errorf("Can only resolve either Docker or OCI images")
 	}
 
 	substitutions := map[string]string{}
@@ -118,11 +116,50 @@ func (r *Resolver) Resolve() (resolvedTemplate string, err error) {
 			return "", fmt.Errorf("Unable to parse substitutions file %s: %w", r.flags.SubstitutionsFile, err)
 		}
 	}
+	resolvedImages := map[string]string{}
+	unseen := map[string]bool{}
+	if len(r.flags.ImgSpecs) > 0 {
+		specs := []imageSpec{}
+		for _, s := range r.flags.ImgSpecs {
+			spec, err := parseImageSpec(s)
+			if err != nil {
+				return "", fmt.Errorf("Unable to parse image spec %q: %s", s, err)
+			}
+			specs = append(specs, spec)
+		}
 
-	resolvedImages, unseen, err := r.publish(specs, stamper)
-	if err != nil {
-		return "", fmt.Errorf("Unable to publish images: %w", err)
+		var err error
+		resolvedImages, unseen, err = r.publish(specs, stamper)
+		if err != nil {
+			return "", fmt.Errorf("Unable to publish images: %w", err)
+		}
 	}
+
+	// new code path
+	if len(r.flags.OCIImages) > 0 {
+		specs := []ociSpec{}
+		for _, s := range r.flags.OCIImages {
+			spec, err := parseOCISpec(s)
+			if err != nil {
+				return "", fmt.Errorf("Unable to parse image spec %q: %s", s, err)
+			}
+			specs = append(specs, spec)
+		}
+
+		for _, s := range specs {
+
+			stampedName := stamper.Stamp(s.name)
+			ref, err := r.parseTag(stampedName, name.WeakValidation)
+			if err != nil {
+				return "", fmt.Errorf("unable to create a docker tag from stamped name %q: %v", stampedName, err)
+			}
+
+			desc, err := s.ImageDescriptor()
+
+			resolvedImages[s.name] = fmt.Sprintf("%s/%s@%v", ref.Context().RegistryStr(), ref.Context().RepositoryStr(), desc.Manifests[0].Digest)
+		}
+	}
+
 	resolvedTemplate, err = resolveTemplate(r.flags.K8sTemplate, resolvedImages, unseen, substitutions)
 	if err != nil {
 		return resolvedTemplate, fmt.Errorf("Unable to resolve template file %q: %w", r.flags.K8sTemplate, err)
@@ -135,6 +172,88 @@ func (r *Resolver) Resolve() (resolvedTemplate string, err error) {
 		return resolvedTemplate, fmt.Errorf("--allow_unused_images can be specified to ignore this error.")
 	}
 	return
+}
+
+type imageDescriptor struct {
+	SchemaVersion int
+	MediaType     string
+	Manifests     []struct {
+		MediaType string
+		Digest    string
+		Size      int
+	}
+}
+
+type ociSpec struct {
+	name      string
+	directory string
+}
+
+func (s *ociSpec) ImageDescriptor() (*imageDescriptor, error) {
+	// Read digest from index.json
+	/*
+		{
+		  "schemaVersion": 2,
+		  "mediaType": "application/vnd.oci.image.index.v1+json",
+		  "manifests": [
+		    {
+		      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+		      "digest": "sha256:3f1e8f6138a66607f7eb17c072795145b86878fc75687b05a23f793a3ab206cd",
+		      "size": 2555
+		    }
+		  ]
+		}
+	*/
+	path := fmt.Sprintf("%s/index.json", s.directory)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return &imageDescriptor{}, fmt.Errorf("could not read index.json: %w", err)
+	}
+	d := &imageDescriptor{}
+	err = json.Unmarshal(data, &d)
+	if err != nil {
+		return &imageDescriptor{}, fmt.Errorf("could not unmarshal index.json: %w", err)
+	}
+	return d, validateImageDescriptor(d)
+}
+
+func validateImageDescriptor(d *imageDescriptor) error {
+	if d.SchemaVersion != 2 {
+		return fmt.Errorf("expected SchemaVersion to be '2'")
+	}
+	if d.MediaType != "application/vnd.oci.image.index.v1+json" {
+		return fmt.Errorf("Expected MediaType to be 'application/vnd.oci.image.index.v1+json'")
+	}
+	if len(d.Manifests) == 0 {
+		return fmt.Errorf("No manifests found")
+	}
+	if d.Manifests[0].MediaType != "application/vnd.oci.image.manifest.v1+json" {
+		return fmt.Errorf("Expected manifest MediaType to be 'application/vnd.oci.image.manifest.v1+json'")
+	}
+	if d.Manifests[0].Digest == "" {
+		return fmt.Errorf("Manifest digest is empty")
+	}
+	return nil
+}
+
+func parseOCISpec(spec string) (ociSpec, error) {
+	result := ociSpec{}
+	splitSpec := strings.Split(spec, ";")
+	for _, s := range splitSpec {
+		splitFields := strings.SplitN(s, "=", 2)
+		if len(splitFields) != 2 {
+			return ociSpec{}, fmt.Errorf("image spec item %q split by '=' into unexpected fields, got %d, want 2", s, len(splitFields))
+		}
+		switch splitFields[0] {
+		case "name":
+			result.name = splitFields[1]
+		case "directory":
+			result.directory = splitFields[1]
+		default:
+			return ociSpec{}, fmt.Errorf("unknown oci spec field %q", splitFields[0])
+		}
+	}
+	return result, nil
 }
 
 // imageSpec describes the differents parts of an image generated by
