@@ -49,6 +49,34 @@ def _impl(ctx):
     """Core implementation of k8s_object."""
 
     all_inputs = [ctx.file.template]
+
+    oci_image_specs = []
+    if ctx.attr.oci_images:
+        # Compute the set of layers from the image_targets.
+        image_target_dict = _string_to_label(
+            ctx.attr.oci_image_targets,
+            ctx.attr.oci_image_target_strings,
+        )
+
+        for tag in ctx.attr.oci_images:
+            resolved_tag = ctx.expand_make_variables("tag", tag, {})
+            target = ctx.attr.oci_images[tag]
+
+            oci_image_spec = {"name": resolved_tag}
+
+            label = image_target_dict[target]
+
+            # This always just contained one file/directory.
+            for file in label.files.to_list():
+                oci_image_spec["directory"] = _runfiles(ctx, file)
+                all_inputs.append(file)
+
+            # Quote the semi-colons so they don't complete the command.
+            oci_image_specs.append("';'".join([
+                "%s=%s" % (k, v)
+                for (k, v) in oci_image_spec.items()
+            ]))
+
     image_specs = []
     if ctx.attr.images:
         # Compute the set of layers from the image_targets.
@@ -130,9 +158,13 @@ def _impl(ctx):
         template = ctx.file._template,
         substitutions = {
             "%{image_chroot}": image_chroot_arg,
-            "%{images}": " ".join([
+            "%{docker_images}": " ".join([
                 "--image_spec=%s" % spec
                 for spec in image_specs
+            ]),
+            "%{oci_images}": " ".join([
+                "--oci_image=%s" % spec
+                for spec in oci_image_specs
             ]),
             "%{resolver_args}": " ".join(ctx.attr.resolver_args or []),
             "%{resolver}": _runfiles(ctx, ctx.executable.resolver),
@@ -307,6 +339,10 @@ _k8s_object = rule(
             # Implicit dependencies.
             "image_targets": attr.label_list(allow_files = True),
             "images": attr.string_dict(),
+            "oci_image_target_strings": attr.string_list(),
+            # Implicit dependencies.
+            "oci_image_targets": attr.label_list(allow_files = True),
+            "oci_images": attr.string_dict(),
             "substitutions": attr.string_dict(),
             "template": attr.label(
                 allow_single_file = [
@@ -496,6 +532,9 @@ def k8s_object(name, **kwargs):
 
     kwargs["image_targets"] = _deduplicate(kwargs.get("images", {}).values())
     kwargs["image_target_strings"] = _deduplicate(kwargs.get("images", {}).values())
+
+    kwargs["oci_image_targets"] = _deduplicate(kwargs.get("oci_images", {}).values())
+    kwargs["oci_image_target_strings"] = _deduplicate(kwargs.get("oci_images", {}).values())
 
     common_args = dict(
         kind = kwargs.get("kind"),
